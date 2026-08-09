@@ -11,6 +11,7 @@ Raw PCM carries no timestamps, so there is nothing to drift.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import threading
 import uuid
@@ -62,6 +63,32 @@ class BuildResult:
 
 def _noop(phase: str, fraction: float, detail: str) -> None:  # pragma: no cover
     pass
+
+
+def _unhide(path: Path) -> None:
+    """Clear the macOS hidden flag from a finished file.
+
+    The build assembles output under a dot-prefixed temporary name so a partial
+    file neither clutters the destination nor gets uploaded by a sync client.
+    In an iCloud Drive folder, though, macOS's FileProvider daemon notices such
+    files and sets ``UF_HIDDEN`` on them within about a minute -- and rename
+    preserves flags. Without this, a long build into iCloud Drive would produce
+    a perfectly good file that never appears in Finder.
+
+    No-op on platforms without BSD file flags.
+    """
+    hidden = getattr(stat, "UF_HIDDEN", 0)
+    if not hidden or not hasattr(os, "chflags"):
+        return
+    try:
+        flags = os.stat(path).st_flags
+    except (OSError, AttributeError):
+        return
+    if flags & hidden:
+        try:
+            os.chflags(path, flags & ~hidden)
+        except OSError:
+            pass  # cosmetic only; never fail a good build over it
 
 
 def _decode_cmd(path: Path, rate: int, channels: int) -> list[str]:
@@ -318,6 +345,7 @@ def build(
             raise BuildError("Output failed verification:\n" + "\n".join(report.problems))
 
         os.replace(temp, output)
+        _unhide(output)
         progress(PHASE_VERIFY, 1.0, "done")
         return BuildResult(
             output=output,
