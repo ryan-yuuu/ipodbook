@@ -6,7 +6,7 @@ iPod refuses to play.
 ## Why this exists
 
 Old iPods track playback position in a **signed 32-bit sample counter**. A book
-fails to play once
+fails to play once the `sample count > 2**31`
 
     duration_seconds x sample_rate  >=  2**31   (2,147,483,648)
 
