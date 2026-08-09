@@ -24,23 +24,29 @@ build a file that would exceed it.
 
 ## Install
 
-Requires `ffmpeg` and `ffprobe` on your PATH.
+Requires [uv](https://docs.astral.sh/uv/) plus `ffmpeg` and `ffprobe` on your
+PATH.
 
 ```bash
-brew install ffmpeg          # macOS
-# sudo apt install ffmpeg    # Debian/Ubuntu
+brew install uv ffmpeg       # macOS
+# sudo apt install ffmpeg    # Debian/Ubuntu (see astral.sh/uv for uv)
 
 cd ipodbook
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+uv sync
 ```
+
+`uv sync` provisions Python 3.12, creates `.venv` and installs the exact
+versions pinned in `uv.lock`. There is nothing to activate.
 
 ## Run
 
 ```bash
-.venv/bin/python -m ipodbook              # GUI
-.venv/bin/python -m ipodbook cli --help   # CLI
+uv run ipodbook              # GUI
+uv run ipodbook cli --help   # CLI
 ```
+
+`uv run` re-syncs the environment first, so a fresh clone needs nothing beyond
+the command itself -- the `uv sync` above is optional.
 
 ## GUI
 
@@ -60,10 +66,10 @@ which is what makes a player remember your position, is always written.
 
 ```bash
 # Which sample rates fit?
-ipodbook cli plan ./discs
+uv run ipodbook cli plan ./discs
 
 # Build
-ipodbook cli build ./discs --out book.m4b \
+uv run ipodbook cli build ./discs --out book.m4b \
     --rate 24000 --bitrate 40 \
     --title "The Time Machine" --author "H. G. Wells"
 ```
@@ -131,4 +137,21 @@ ipodbook/
     ffmpeg.py    binary discovery, probing, encoder detection
   gui/           PySide6 window, widgets, worker threads
   cli.py
+pyproject.toml   project metadata, dependencies, entry points
+uv.lock          exact resolved versions (committed; do not edit by hand)
+.python-version  interpreter uv provisions
 ```
+
+## Development
+
+```bash
+uv sync                      # match the lockfile exactly
+uv add <package>             # add a dependency and update the lock
+uv remove <package>          # drop one
+uv lock --upgrade            # refresh pinned versions
+uv run python -c '...'       # anything, inside the project environment
+```
+
+`uv.lock` is committed so every machine resolves to identical versions. Change
+dependencies through `uv add`/`uv remove` rather than editing `pyproject.toml`
+by hand, so the lockfile stays in step.

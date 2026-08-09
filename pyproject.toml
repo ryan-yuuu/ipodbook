@@ -9,9 +9,12 @@ license-files = ["LICENSE"]
 dependencies = ["PySide6>=6.5", "mutagen>=1.45"]
 
 [project.scripts]
-ipodbook = "ipodbook.cli:main"
+# Opens the GUI; `ipodbook cli ...` reaches the command line. Matches
+# `python -m ipodbook`, so both entry points behave identically.
+ipodbook = "ipodbook.__main__:main"
 
 [project.gui-scripts]
+# Same GUI without a console window attached on Windows.
 ipodbook-gui = "ipodbook.gui.app:run"
 
 [build-system]
