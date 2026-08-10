@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QProgressBar, QSizePolicy, QToolButton,
-    QVBoxLayout, QWidget,
+    QApplication, QFrame, QHBoxLayout, QLabel, QProgressBar, QSizePolicy,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 # Bar colours by how much of the sample budget is consumed.
 _GREEN = "#2f9e44"
 _AMBER = "#e8a13a"
 _RED = "#d84a3f"
+
+#: Opacity of de-emphasised text, matching the ~60% macOS uses for secondary
+#: labels. Applied to the theme's own text colour rather than to a fixed grey.
+_MUTED_ALPHA = 150
+
+
+def muted_css() -> str:
+    """A ``color:`` declaration for secondary text that survives dark mode.
+
+    Qt's ``palette(mid)`` is a bevel-shading role, not a text role: it is a dark
+    grey in every theme, so it reads correctly against a light window and turns
+    illegible against a dark one. Fading the theme's actual text colour instead
+    de-emphasises the same amount in either direction.
+    """
+    colour = QApplication.palette().color(QPalette.WindowText)
+    return f"color: rgba({colour.red()}, {colour.green()}, {colour.blue()}, {_MUTED_ALPHA});"
 
 
 class HelpLabel(QLabel):
@@ -24,7 +41,27 @@ class HelpLabel(QLabel):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setWordWrap(True)
-        self.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self._restyling = False
+        self._restyle()
+
+    def _restyle(self) -> None:
+        # setStyleSheet itself posts a PaletteChange back to this widget, so
+        # without the guard restyling would call itself forever.
+        if self._restyling:
+            return
+        self._restyling = True
+        try:
+            self.setStyleSheet(f"{muted_css()} font-size: 11px;")
+        finally:
+            self._restyling = False
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        # Follow the system switching between light and dark while running.
+        # Only the application-level event is a real theme change; the
+        # per-widget one also fires for our own restyling.
+        if event.type() == QEvent.ApplicationPaletteChange:
+            self._restyle()
+        super().changeEvent(event)
 
 
 class SectionTitle(QLabel):
@@ -88,7 +125,7 @@ class BudgetMeter(QFrame):
 
         self._bar.setValue(0)
         self._verdict.setText("no limit")
-        self._verdict.setStyleSheet(f"color: palette(mid);")
+        self._verdict.setStyleSheet(muted_css())
         self._paint(_GREEN)
         self._detail.setText(
             f"{duration_text} - {limits.format_samples(samples)} samples. "

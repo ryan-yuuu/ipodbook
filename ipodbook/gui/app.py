@@ -775,8 +775,14 @@ class MainWindow(QMainWindow):
         elif seconds > 0 and self.tracks and self._plan() is None:
             reasons.append("no volume split fits")
         self.build_button.setEnabled(not reasons and not busy)
-        if reasons and not busy:
+        if busy:
+            return
+        if reasons:
             self.status_label.setText("To build: " + ", ".join(reasons) + ".")
+        elif self.status_label.text().startswith("To build:"):
+            # Clear our own stale blocker, but leave any other message alone --
+            # otherwise changing a setting would wipe the result of a build.
+            self.status_label.setText("Ready." if self._exact else "")
 
     # --------------------------------------------------------------- output
     def _suggest_output(self) -> None:
