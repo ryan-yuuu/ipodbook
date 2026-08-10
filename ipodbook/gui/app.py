@@ -75,10 +75,13 @@ class MainWindow(QMainWindow):
 
         self.tracks: list[TrackInfo] = []
         self.output_path: Path | None = None
+        self._built: list[Path] = []
         self.cover_path: Path | None = None
+        self.inherited_cover: bytes | None = None
         self._analyzer: AnalyzeWorker | None = None
         self._builder: BuildWorker | None = None
         self._exact = False
+        self._rate_wanted: int | None = None
         self._encoders = ffmpeg.available_encoders()
 
         central = QWidget()
@@ -171,6 +174,18 @@ class MainWindow(QMainWindow):
         row.addWidget(self.output_button)
         row.addWidget(self.output_label, 1)
         output_layout.addLayout(row)
+
+        output_layout.addSpacing(6)
+        output_layout.addWidget(QLabel("Volumes"))
+        self.volumes_combo = QComboBox()
+        self.volumes_combo.addItem("Single file", 1)
+        self.volumes_combo.addItem("Split to fit the budget", None)
+        for count in range(2, 9):
+            self.volumes_combo.addItem(f"{count} volumes", count)
+        self.volumes_combo.currentIndexChanged.connect(self._on_volumes_changed)
+        output_layout.addWidget(self.volumes_combo)
+        self.volumes_help = HelpLabel()
+        output_layout.addWidget(self.volumes_help)
         layout.addWidget(output_box)
 
         # --- target --------------------------------------------------------
@@ -192,6 +207,9 @@ class MainWindow(QMainWindow):
 
         self.rate_combo = QComboBox()
         self.rate_combo.currentIndexChanged.connect(self._on_audio_changed)
+        # ``activated`` fires only for real user interaction, unlike
+        # ``currentIndexChanged``, which also fires when we rebuild the list.
+        self.rate_combo.activated.connect(self._on_rate_chosen)
         audio_layout.addWidget(QLabel("Sample rate"))
         audio_layout.addWidget(self.rate_combo)
         self.rate_help = HelpLabel()
@@ -246,10 +264,13 @@ class MainWindow(QMainWindow):
         self.chapter_style_combo.addItem("Folder and filename", "folder")
         self.chapter_style_combo.addItem("Filename", "filename")
         self.chapter_style_combo.addItem("Chapter 1, 2, 3…", "number")
+        self.chapter_style_combo.addItem("Title stored in the file", "embedded")
         chapter_layout.addWidget(self.chapter_style_combo)
         chapter_layout.addWidget(HelpLabel(
             "Chapter boundaries come from each file's measured length, not from "
-            "its metadata, so they land exactly on the track transitions."
+            "its metadata, so they land exactly on the track transitions. "
+            "\"Title stored in the file\" reuses the name an m4b already carries "
+            "and falls back to the filename when there is none."
         ))
         layout.addWidget(chapter_box)
 
@@ -293,10 +314,23 @@ class MainWindow(QMainWindow):
         cover_row.addWidget(self.cover_clear)
         cover_row.addWidget(self.cover_label, 1)
         meta_section.body.addLayout(cover_row)
+
+        inherit_row = QHBoxLayout()
+        self.inherit_button = QPushButton("Read from Source Files")
+        self.inherit_button.setToolTip(
+            "Fill these fields from the tags the source files already carry"
+        )
+        self.inherit_button.clicked.connect(self._inherit_metadata)
+        inherit_row.addWidget(self.inherit_button)
+        inherit_row.addStretch(1)
+        meta_section.body.addLayout(inherit_row)
+
         meta_section.body.addWidget(HelpLabel(
             "Every field here is optional and left out of the file when blank. "
             "The audiobook flag that makes players remember your position is "
-            "always written."
+            "always written. When merging existing audiobooks, \"Read from "
+            "Source Files\" recovers the title, author, narrator and cover art "
+            "the files already hold."
         ))
         layout.addWidget(meta_section)
 
@@ -500,6 +534,27 @@ class MainWindow(QMainWindow):
         data = self.rate_combo.currentData()
         return int(data) if data else 22050
 
+    def _volumes(self) -> int | None:
+        return self.volumes_combo.currentData()
+
+    def _plan(self) -> list[list[int]] | None:
+        """Volume split for the current settings, or None if there isn't one."""
+        durations = [t.seconds for t in self.tracks if t.ok]
+        if not durations:
+            return None
+        # Provisional durations run low, so plan against the padded figure --
+        # otherwise a book that only just fits gains a volume after measuring.
+        scale = 1.0 if self._exact else 1.01
+        try:
+            return limits.plan_volumes(
+                [d * scale for d in durations],
+                self._rate(),
+                self._device().max_samples,
+                volumes=self._volumes(),
+            )
+        except limits.CannotSplit:
+            return None
+
     def _total_seconds(self) -> float:
         return measure.total_seconds(self.tracks)
 
@@ -523,37 +578,92 @@ class MainWindow(QMainWindow):
         self._update_budget()
         self._update_build_enabled()
 
+    def _on_rate_chosen(self) -> None:
+        self._rate_wanted = self._rate()
+
+    def _on_volumes_changed(self) -> None:
+        # Splitting changes which rates are reachable, so the rate list has to
+        # be rebuilt as well as the meter.
+        self._refresh_rates()
+        self._update_budget()
+        self._update_build_enabled()
+
     def _on_chapters_toggled(self, checked: bool) -> None:
         self.chapter_style_combo.setEnabled(checked)
+
+    def _rate_usable(self, rate: int, seconds: float) -> bool:
+        """Whether this rate can produce a playable result.
+
+        With splitting enabled the whole book no longer has to fit in one file,
+        so a rate is usable as long as *some* arrangement of volumes works.
+        """
+        if seconds <= 0:
+            return True
+        device = self._device()
+        if self._volumes() == 1:
+            return limits.fits(seconds, rate, device.max_samples)
+        longest = max((t.seconds for t in self.tracks if t.ok), default=0.0)
+        return longest <= limits.volume_capacity_s(rate, device.max_samples)
+
+    def _source_rate(self) -> int:
+        """Lowest sample rate present in the sources, or 0 if unknown."""
+        rates = {t.sample_rate for t in self.tracks if t.ok and t.sample_rate}
+        return min(rates) if rates else 0
+
+    def _preferred_rate(self, seconds: float) -> int:
+        """The rate to select when the user has not chosen one.
+
+        Encoding above the sources' own rate cannot recover detail that is not
+        there -- it only inflates the file and spends sample budget on an empty
+        frequency band -- so the sources set the ceiling. Below that, take the
+        highest rate the current volume settings can actually deliver.
+        """
+        usable = [r for r in limits.AAC_SAMPLE_RATES if self._rate_usable(r, seconds)]
+        if not usable:
+            return limits.AAC_SAMPLE_RATES[0]
+        ceiling = self._source_rate()
+        within = [r for r in usable if r <= ceiling] if ceiling else []
+        return within[-1] if within else usable[-1]
 
     def _refresh_rates(self) -> None:
         """Rebuild the rate list, disabling anything that cannot fit."""
         device = self._device()
         seconds = self._budget_seconds()
-        previous = self.rate_combo.currentData()
+        splitting = self._volumes() != 1
 
         self.rate_combo.blockSignals(True)
         self.rate_combo.clear()
         model = self.rate_combo.model()
         for rate in limits.AAC_SAMPLE_RATES:
-            fits = seconds <= 0 or limits.fits(seconds, rate, device.max_samples)
+            usable = self._rate_usable(rate, seconds)
             label = f"{rate / 1000:g} kHz"
             if seconds > 0 and device.has_limit:
-                usage = limits.usage_fraction(seconds, rate, device.max_samples)
-                label += f"  -  {usage * 100:.0f}% of budget" if fits else "  -  too long"
+                if not usable:
+                    label += "  -  too long"
+                elif splitting and not limits.fits(seconds, rate, device.max_samples):
+                    volumes = limits.min_volumes(
+                        [t.seconds for t in self.tracks if t.ok], rate,
+                        device.max_samples, headroom=limits.SAFE_BUDGET_FRACTION,
+                    )
+                    label += f"  -  {volumes} volumes"
+                else:
+                    usage = limits.usage_fraction(seconds, rate, device.max_samples)
+                    label += f"  -  {usage * 100:.0f}% of budget"
             self.rate_combo.addItem(label, rate)
-            if not fits:
+            if not usable:
                 item = model.item(self.rate_combo.count() - 1)
                 if item is not None:
                     item.setEnabled(False)
 
-        target = int(previous) if previous else 22050
-        index = self.rate_combo.findData(target)
-        if index >= 0 and (seconds <= 0 or limits.fits(seconds, target, device.max_samples)):
-            self.rate_combo.setCurrentIndex(index)
+        # A rate the user picked is honoured whenever it works, and remembered
+        # while it does not -- so a rate that only a split can deliver comes
+        # back when splitting is re-enabled, rather than being lost the moment
+        # a single-file setting invalidates it.
+        if self._rate_wanted and self._rate_usable(self._rate_wanted, seconds):
+            wanted = self._rate_wanted
         else:
-            best = limits.best_rate(seconds, device.max_samples) if seconds > 0 else 22050
-            self.rate_combo.setCurrentIndex(max(0, self.rate_combo.findData(best or 22050)))
+            wanted = self._preferred_rate(seconds) if seconds > 0 else 22050
+        self.rate_combo.setCurrentIndex(max(0, self.rate_combo.findData(wanted)))
         self.rate_combo.blockSignals(False)
 
     def _update_budget(self) -> None:
@@ -579,6 +689,8 @@ class MainWindow(QMainWindow):
                 "the sample budget."
             )
 
+        self._update_volumes_help()
+
         if seconds <= 0:
             self.meter.set_idle()
             return
@@ -589,10 +701,28 @@ class MainWindow(QMainWindow):
             self.meter.set_unlimited(samples, duration_text)
             return
 
+        # When the book is being split, the number that matters is the longest
+        # volume, not the whole book -- a 195%-of-budget bar would be nonsense
+        # for a plan that produces three perfectly legal files.
+        plan = self._plan()
+        if plan is not None and len(plan) > 1:
+            durations = [t.seconds for t in self.tracks if t.ok]
+            spans = [sum(durations[i] for i in group) for group in plan]
+            longest = max(spans)
+            self.meter.update_budget(
+                samples=limits.sample_count(longest, rate),
+                max_samples=device.max_samples,
+                duration_text=limits.format_duration(longest),
+                provisional=not self._exact,
+                note=f"Longest of {len(plan)} volumes; {duration_text} in total.",
+            )
+            return
+
         note = ""
         if not limits.fits(self._budget_seconds(), rate, device.max_samples):
             best = limits.best_rate(self._budget_seconds(), device.max_samples)
-            note = f"Use {best / 1000:g} kHz or lower." if best else "Too long for any rate."
+            note = f"Use {best / 1000:g} kHz or lower, or split into volumes." if best else \
+                "Too long for any rate; split into volumes."
         self.meter.update_budget(
             samples=samples,
             max_samples=device.max_samples,
@@ -600,6 +730,35 @@ class MainWindow(QMainWindow):
             provisional=not self._exact,
             note=note,
         )
+
+    def _update_volumes_help(self) -> None:
+        """Describe the split the current settings would produce."""
+        if not self.tracks:
+            self.volumes_help.setText(
+                "Split a book that is too long for one file across several."
+            )
+            return
+        plan = self._plan()
+        if plan is None:
+            self.volumes_help.setText(
+                "No split fits at this sample rate. Choose a lower rate."
+            )
+            return
+        if len(plan) == 1:
+            self.volumes_help.setText("One file.")
+            return
+        durations = [t.seconds for t in self.tracks if t.ok]
+        rate, device = self._rate(), self._device()
+        spans = [sum(durations[i] for i in group) for group in plan]
+        peak = max(limits.usage_fraction(s, rate, device.max_samples) for s in spans)
+        text = (
+            f"{len(plan)} files, the longest {limits.format_duration(max(spans))} "
+            f"at {peak * 100:.0f}% of the budget."
+        )
+        if self.output_path is not None:
+            example = build.volume_path(self.output_path, 1, len(plan))
+            text += f"  Named \"{example.name}\"…"
+        self.volumes_help.setText(text)
 
     def _update_build_enabled(self) -> None:
         busy = self._builder is not None and self._builder.isRunning()
@@ -611,8 +770,10 @@ class MainWindow(QMainWindow):
         if not self._encoders:
             reasons.append("install ffmpeg")
         seconds = self._budget_seconds()
-        if seconds > 0 and not limits.fits(seconds, self._rate(), self._device().max_samples):
+        if seconds > 0 and not self._rate_usable(self._rate(), seconds):
             reasons.append("sample budget exceeded")
+        elif seconds > 0 and self.tracks and self._plan() is None:
+            reasons.append("no volume split fits")
         self.build_button.setEnabled(not reasons and not busy)
         if reasons and not busy:
             self.status_label.setText("To build: " + ", ".join(reasons) + ".")
@@ -645,6 +806,7 @@ class MainWindow(QMainWindow):
             return
         self.output_label.setText(str(self.output_path))
         self.output_label.setToolTip(str(self.output_path))
+        self._update_volumes_help()
 
     def _choose_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -656,6 +818,7 @@ class MainWindow(QMainWindow):
 
     def _clear_cover(self) -> None:
         self.cover_path = None
+        self.inherited_cover = None
         self.cover_label.setText("none")
 
     # ---------------------------------------------------------------- build
@@ -665,7 +828,43 @@ class MainWindow(QMainWindow):
             setattr(meta, key, edit.text().strip())
         meta.description = self.description_edit.toPlainText().strip()
         meta.synopsis = self.synopsis_edit.toPlainText().strip()
+        # A chosen cover file always wins over one inherited from the sources.
+        if self.cover_path is None and self.inherited_cover:
+            meta.cover_data = self.inherited_cover
         return meta
+
+    def _inherit_metadata(self) -> None:
+        """Fill the metadata form from the tags the sources already carry."""
+        if not self.tracks:
+            QMessageBox.information(
+                self, "No source files",
+                "Add the audiobook files first, then read their tags.",
+            )
+            return
+        for track in self.tracks:
+            found = tags.read_source_metadata(track.path)
+            if found.is_empty():
+                continue
+            for key, edit in self.meta_fields.items():
+                value = getattr(found, key, "")
+                if value:
+                    edit.setText(value)
+            if found.description:
+                self.description_edit.setPlainText(found.description)
+            if found.synopsis:
+                self.synopsis_edit.setPlainText(found.synopsis)
+            if found.cover_data:
+                self.inherited_cover = found.cover_data
+                if self.cover_path is None:
+                    self.cover_label.setText(
+                        f"from {track.path.name} ({len(found.cover_data) // 1024} KiB)"
+                    )
+            self.status_label.setText(f"Read tags from {track.path.name}.")
+            return
+        QMessageBox.information(
+            self, "No tags found",
+            "None of the source files carry tags ipodbook can read.",
+        )
 
     def _settings(self) -> build.Settings:
         return build.Settings(
@@ -676,16 +875,27 @@ class MainWindow(QMainWindow):
             device_key=self._device().key,
             chapters=self.chapters_check.isChecked(),
             chapter_style=str(self.chapter_style_combo.currentData() or "folder"),
+            volumes=self._volumes(),
         )
 
     def _start_build(self) -> None:
         if self.output_path is None or not self.tracks:
             return
+        plan = self._plan()
+        volumes = len(plan) if plan else 1
+        existing = [
+            build.volume_path(self.output_path, i, volumes)
+            for i in range(1, volumes + 1)
+        ]
+        existing = [p for p in existing if p.exists()]
         overwrite = False
-        if self.output_path.exists():
+        if existing:
+            names = "\n".join(f"  {p.name}" for p in existing[:5])
+            if len(existing) > 5:
+                names += f"\n  …and {len(existing) - 5} more"
             answer = QMessageBox.question(
                 self, "Replace file?",
-                f"{self.output_path.name} already exists.\n\nReplace it?",
+                f"These already exist:\n\n{names}\n\nReplace them?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
@@ -725,17 +935,27 @@ class MainWindow(QMainWindow):
         self._builder = None
         self._update_build_enabled()
 
-    def _on_build_ok(self, result: build.BuildResult) -> None:
+    def _on_build_ok(self, results: list[build.BuildResult]) -> None:
         self._finish_build_ui()
         device = self._device()
-        parts = [
-            limits.format_duration(result.duration_s),
-            limits.format_size(result.size_bytes),
-            f"{result.chapters} chapters",
-        ]
-        if device.has_limit:
-            parts.append(f"{result.samples / device.max_samples * 100:.0f}% of budget")
-        self.status_label.setText(f"Built {result.output.name} — " + ", ".join(parts))
+        self._built = [r.output for r in results]
+        if len(results) == 1:
+            result = results[0]
+            parts = [
+                limits.format_duration(result.duration_s),
+                limits.format_size(result.size_bytes),
+                f"{result.chapters} chapters",
+            ]
+            if device.has_limit:
+                parts.append(f"{result.samples / device.max_samples * 100:.0f}% of budget")
+            self.status_label.setText(f"Built {result.output.name} — " + ", ".join(parts))
+        else:
+            span = limits.format_duration(sum(r.duration_s for r in results))
+            size = limits.format_size(sum(r.size_bytes for r in results))
+            chapters = sum(r.chapters for r in results)
+            self.status_label.setText(
+                f"Built {len(results)} volumes — {span}, {size}, {chapters} chapters"
+            )
         self.reveal_button.setVisible(True)
         # A build measures every track exactly, so the meter is no longer provisional.
         self._exact = True
@@ -757,9 +977,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelling…")
 
     def _reveal_output(self) -> None:
-        if self.output_path is None or not self.output_path.exists():
+        target = next((p for p in self._built if p.exists()), self.output_path)
+        if target is None or not target.exists():
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_path.parent)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.parent)))
 
     # ----------------------------------------------------------------- misc
     def _warn_missing_ffmpeg(self) -> None:

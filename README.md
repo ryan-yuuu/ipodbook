@@ -60,7 +60,13 @@ valid. Durations are estimated instantly, then measured exactly in the
 background -- the meter is drawn dashed until measurement finishes.
 
 All metadata is optional and omitted when blank. The audiobook flag (`stik=2`),
-which is what makes a player remember your position, is always written.
+which is what makes a player remember your position, is always written. When
+merging existing audiobooks, **Read from Source Files** fills the form from the
+tags and cover art the sources already carry.
+
+Set **Volumes** to *Split to fit the budget* for a book too long for one file.
+The meter then tracks the longest volume rather than the whole book, and the
+sample-rate list shows how many volumes each rate would need.
 
 ## CLI
 
@@ -74,8 +80,53 @@ uv run ipodbook cli build ./discs --out book.m4b \
     --title "The Time Machine" --author "H. G. Wells"
 ```
 
-`plan` prints every AAC rate with its sample count and budget usage, then names
-the highest rate that fits.
+`plan` prints every AAC rate with its sample count and budget usage, names the
+highest rate that fits, and — when the book is too long for one file — shows the
+volume split it would need.
+
+## Merging existing audiobooks
+
+A book delivered as a pile of `.m4b` files is just another source list: they go
+through the same pipeline as MP3s, in the same order, with the same guarantees.
+Two flags make the result look like the book it came from.
+
+```bash
+uv run ipodbook cli build "./Monte Cristo" --out "Monte Cristo.m4b" \
+    --rate 22050 --chapter-style embedded --inherit-tags --volumes auto
+```
+
+`--chapter-style embedded` names each chapter with the title the source file
+already carries (`Chapter 47`) instead of its filename. Splitters routinely
+leave zero-length marker entries naming the neighbouring file's chapter — on a
+117-file book, 187 of its 304 entries were of that kind — so ipodbook uses the
+longest real chapter in each file and ignores anything under a second. Files
+with no usable chapter fall back to their filename.
+
+`--inherit-tags` recovers the title, author, narrator, year, description and
+cover art from the first source file that has them. Anything you pass explicitly
+still wins.
+
+**Match the source sample rate.** Encoding above it cannot recover detail that
+is not in the file; it only inflates the output and spends sample budget on an
+empty frequency band. A 22.05 kHz source should be built at 22050, where the
+pipeline resamples nothing at all. The GUI defaults to this.
+
+### Splitting into volumes
+
+A long book cannot become one iPod-playable file. 52 hours needs 11 kHz to fit
+under 2³¹ — telephone bandwidth, at 97% of budget. Splitting is the way out:
+
+```bash
+uv run ipodbook cli build ./parts --out "Book.m4b" --rate 22050 --volumes auto
+```
+
+`auto` picks the fewest volumes that fit with room to spare, then balances them
+so no volume sits near the limit. `--volumes 3` pins the count instead; either
+way every volume is checked against the budget before anything is encoded.
+Volumes are written as `Book - Vol 1 of 3.m4b`, share one album tag and carry
+track numbers, so a player lists them as one book in order.
+
+Splits fall on file boundaries, so a chapter is never cut in half.
 
 ## Choosing settings
 
@@ -128,15 +179,16 @@ process. This is deliberate and load-bearing:
 ```
 ipodbook/
   core/          GUI-agnostic; shared by CLI and GUI
-    limits.py    device budgets, AAC rate table, feasibility math
+    limits.py    device budgets, AAC rate table, feasibility and volume maths
     discover.py  file scanning, natural sort, chapter titles
-    measure.py   exact duration measurement by decoding
-    tags.py      ffmetadata chapters + mutagen tag writing
-    build.py     the pipeline
+    measure.py   exact duration measurement by decoding, source chapters
+    tags.py      ffmetadata chapters + mutagen tag writing and reading
+    build.py     the pipeline, single file or split across volumes
     verify.py    post-build checks
     ffmpeg.py    binary discovery, probing, encoder detection
   gui/           PySide6 window, widgets, worker threads
   cli.py
+tests/           pure-logic tests; no ffmpeg or audio files required
 pyproject.toml   project metadata, dependencies, entry points
 uv.lock          exact resolved versions (committed; do not edit by hand)
 .python-version  interpreter uv provisions
@@ -145,6 +197,7 @@ uv.lock          exact resolved versions (committed; do not edit by hand)
 ## Development
 
 ```bash
+uv run pytest                # run the tests
 uv sync                      # match the lockfile exactly
 uv add <package>             # add a dependency and update the lock
 uv remove <package>          # drop one

@@ -14,7 +14,7 @@ from __future__ import annotations
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -31,6 +31,23 @@ class Cancelled(RuntimeError):
     """Raised when the caller aborts a measurement or build."""
 
 
+@dataclass(frozen=True)
+class SourceChapter:
+    """A chapter already present inside a source file.
+
+    Times are on the *container's* timeline, which is not quite the timeline of
+    the audio we decode out of it -- see ``build`` for why the two differ.
+    """
+
+    start: float
+    end: float
+    title: str
+
+    @property
+    def seconds(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
 @dataclass
 class TrackInfo:
     """One source file and everything we know about it."""
@@ -42,21 +59,43 @@ class TrackInfo:
     channels: int = 0
     codec: str = ""
     error: str = ""
+    chapters: list[SourceChapter] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.error
 
 
+def _parse_chapters(data: dict) -> list[SourceChapter]:
+    """Chapter entries from a parsed ffprobe result, in file order."""
+    found: list[SourceChapter] = []
+    for raw in data.get("chapters", []):
+        try:
+            start = float(raw["start_time"])
+            end = float(raw["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = (raw.get("tags") or {}).get("title") or ""
+        found.append(SourceChapter(start=start, end=end, title=title))
+    return found
+
+
 def probe_quick(path: Path) -> TrackInfo:
-    """Instant, approximate metadata for immediate UI feedback."""
+    """Instant, approximate metadata for immediate UI feedback.
+
+    One ffprobe call collects the stream layout, the container duration and any
+    embedded chapters together, so knowing a file's chapters costs nothing
+    beyond what reading its duration already cost.
+    """
     info = TrackInfo(path=path)
     try:
-        stream = ffmpeg.audio_stream_info(path)
+        data = ffmpeg.probe(path, chapters=True)
+        stream = ffmpeg.audio_stream(data, path.name)
         info.sample_rate = stream["sample_rate"]
         info.channels = stream["channels"]
         info.codec = stream["codec"] or ""
-        info.seconds = ffmpeg.estimated_duration(path)
+        info.seconds = ffmpeg.container_duration(data)
+        info.chapters = _parse_chapters(data)
     except Exception as exc:  # noqa: BLE001 - surfaced to the user verbatim
         info.error = str(exc)
     return info

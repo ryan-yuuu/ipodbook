@@ -15,6 +15,7 @@ Bitrate does not appear in the equation and is therefore unconstrained.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 #: Sample rates expressible in MPEG-4 AAC. The format stores the rate as a
 #: 4-bit index into a fixed table, so values outside it (e.g. 30000) cannot be
@@ -105,6 +106,134 @@ def best_rate(duration_s: float, max_samples: int | None) -> int | None:
     """Highest AAC rate that fits, i.e. the most bandwidth available."""
     usable = feasible_rates(duration_s, max_samples)
     return usable[-1] if usable else None
+
+
+class CannotSplit(ValueError):
+    """No arrangement of these files fits the budget."""
+
+
+def volume_capacity_s(sample_rate: int, max_samples: int | None) -> float:
+    """Longest a single volume may run, in seconds.
+
+    One sample short of the device limit, because ``fits`` is strict: a track of
+    exactly ``max_samples`` does not play.
+    """
+    if max_samples is None:
+        return float("inf")
+    return (max_samples - 1) / sample_rate
+
+
+def _pack(durations: Sequence[float], capacity: float) -> list[list[int]]:
+    """Greedily group consecutive indices without exceeding ``capacity``.
+
+    Order is fixed -- these are chapters of one book -- so first-fit in order
+    also yields the fewest possible groups.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    load = 0.0
+    for index, duration in enumerate(durations):
+        if current and load + duration > capacity:
+            groups.append(current)
+            current, load = [index], duration
+        else:
+            current.append(index)
+            load += duration
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _balanced(durations: Sequence[float], count: int) -> list[list[int]]:
+    """Split into at most ``count`` groups, minimising the longest one.
+
+    Binary search on capacity. The groups are taken from the last *feasible*
+    probe rather than recomputed from the converged capacity, so a rounding
+    error at the boundary can never yield more groups than asked for.
+    """
+    low, high = max(durations), sum(durations)
+    best = _pack(durations, high)
+    for _ in range(64):
+        middle = (low + high) / 2
+        groups = _pack(durations, middle)
+        if len(groups) <= count:
+            best, high = groups, middle
+        else:
+            low = middle
+    return best
+
+
+#: Share of the budget an automatically chosen split aims to stay under.
+#: Packing to the bare minimum number of volumes leaves them sitting at 96-99%
+#: of the limit, which is no place to be when the whole point of the tool is
+#: margin. This is the same threshold at which the budget meter turns amber.
+SAFE_BUDGET_FRACTION = 0.85
+
+
+def min_volumes(
+    durations: Sequence[float],
+    sample_rate: int,
+    max_samples: int | None,
+    *,
+    headroom: float = 1.0,
+) -> int:
+    """Fewest volumes this book can be split into and still play.
+
+    ``headroom`` below 1.0 packs against a fraction of the budget, trading extra
+    volumes for margin.
+    """
+    if max_samples is None:
+        return 1
+    capacity = volume_capacity_s(sample_rate, max_samples) * headroom
+    return len(_pack(durations, capacity))
+
+
+def plan_volumes(
+    durations: Sequence[float],
+    sample_rate: int,
+    max_samples: int | None,
+    *,
+    volumes: int | None = None,
+) -> list[list[int]]:
+    """Group file indices into volumes that each fit the sample budget.
+
+    ``volumes=None`` picks the fewest that fit inside ``SAFE_BUDGET_FRACTION``
+    and then balances them, so no volume sits needlessly close to the limit.
+    An explicit count is honoured as long as every volume still plays. Splits
+    fall on file boundaries; a single file longer than the budget cannot be
+    rescued by splitting.
+    """
+    if not durations:
+        raise CannotSplit("No source files to split.")
+    capacity = volume_capacity_s(sample_rate, max_samples)
+
+    if volumes is None:
+        if max_samples is None:
+            return [list(range(len(durations)))]
+        longest = max(durations)
+        if longest > capacity:
+            raise CannotSplit(
+                f"One file alone runs {format_duration(longest)}, over the "
+                f"{format_duration(capacity)} a volume may hold at "
+                f"{sample_rate / 1000:g} kHz. Use a lower sample rate."
+            )
+        volumes = min_volumes(
+            durations, sample_rate, max_samples, headroom=SAFE_BUDGET_FRACTION
+        )
+
+    volumes = max(1, min(volumes, len(durations)))
+    groups = _balanced(durations, volumes)
+
+    if max_samples is not None:
+        for index, group in enumerate(groups, 1):
+            total = sum(durations[i] for i in group)
+            if not fits(total, sample_rate, max_samples):
+                raise CannotSplit(
+                    f"Volume {index} would run {format_duration(total)}, over the "
+                    f"{format_duration(capacity)} limit at {sample_rate / 1000:g} kHz. "
+                    f"Use more volumes or a lower sample rate."
+                )
+    return groups
 
 
 def estimated_size_bytes(duration_s: float, bitrate_kbps: int, sample_rate: int) -> int:

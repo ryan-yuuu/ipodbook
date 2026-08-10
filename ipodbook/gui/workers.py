@@ -43,6 +43,7 @@ class AnalyzeWorker(QThread):
                 track.sample_rate = probed.sample_rate
                 track.channels = probed.channels
                 track.codec = probed.codec
+                track.chapters = probed.chapters
                 track.error = probed.error
                 track.exact = False
                 self.row_ready.emit(index, track)
@@ -74,7 +75,7 @@ class BuildWorker(QThread):
     """Runs the pipeline and relays progress."""
 
     progress = Signal(str, float, str)   # phase, fraction, detail
-    finished_ok = Signal(object)         # BuildResult
+    finished_ok = Signal(object)         # list[BuildResult], one per volume
     failed = Signal(str)
     cancelled = Signal()
 
@@ -101,7 +102,7 @@ class BuildWorker(QThread):
 
     def run(self) -> None:  # noqa: D102
         try:
-            result = build.build(
+            results = build.build_volumes(
                 self._tracks,
                 self._output,
                 self._settings,
@@ -119,4 +120,4 @@ class BuildWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"Unexpected error: {exc}")
         else:
-            self.finished_ok.emit(result)
+            self.finished_ok.emit(results)

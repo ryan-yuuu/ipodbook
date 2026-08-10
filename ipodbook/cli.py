@@ -14,6 +14,16 @@ def _bitrate(text: str) -> int:
     return int(text.lower().rstrip("k"))
 
 
+def _volumes(text: str) -> int | None:
+    """``auto`` means "as many as it takes"; a number pins the count."""
+    if text.strip().lower() == "auto":
+        return None
+    count = int(text)
+    if count < 1:
+        raise argparse.ArgumentTypeError("volume count must be 1 or more")
+    return count
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ipodbook",
@@ -40,8 +50,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     build_cmd.add_argument("--no-chapters", action="store_true", help="omit chapter markers")
     build_cmd.add_argument(
-        "--chapter-style", default="folder", choices=["filename", "folder", "number"],
-        help="how chapter titles are derived (default folder)",
+        "--chapter-style", default="folder",
+        choices=["filename", "folder", "number", "embedded"],
+        help="how chapter titles are derived (default folder); 'embedded' takes "
+             "the title each source file already carries, which is what you want "
+             "when merging existing m4b files",
+    )
+    build_cmd.add_argument(
+        "--volumes", type=_volumes, default=1, metavar="N|auto",
+        help="split across N output files, or 'auto' for the fewest that fit the "
+             "sample budget with room to spare (default 1)",
+    )
+    build_cmd.add_argument(
+        "--inherit-tags", action="store_true",
+        help="take title, author, narrator, year, description and cover art from "
+             "the first source file that has them; explicit flags still win",
     )
     build_cmd.add_argument("--force", action="store_true", help="overwrite an existing output")
 
@@ -105,6 +128,26 @@ def _cmd_plan(args) -> int:
         print(f"\nHighest rate that fits: {best} Hz ({limits.nyquist_hz(best) / 1000:g} kHz bandwidth)")
     else:
         print("\nNo AAC sample rate fits this duration on this device.")
+
+    if device.has_limit:
+        durations = [t.seconds for t in tracks if t.ok]
+        source_rates = {t.sample_rate for t in tracks if t.ok and t.sample_rate}
+        # Encoding above the source rate cannot add detail, so the rate worth
+        # planning against is the sources' own -- never higher.
+        rate = min(source_rates) if source_rates else 22050
+        try:
+            groups = limits.plan_volumes(durations, rate, device.max_samples)
+        except limits.CannotSplit as exc:
+            print(f"\nCannot split at {rate} Hz: {exc}")
+            return 0
+        if len(groups) > 1:
+            print(f"\nAt the source rate of {rate} Hz this needs {len(groups)} volumes:")
+            for index, group in enumerate(groups, 1):
+                span = sum(durations[i] for i in group)
+                print(f"  Vol {index}: {len(group):>4} files  "
+                      f"{limits.format_duration(span):>10}  "
+                      f"{limits.usage_fraction(span, rate, device.max_samples) * 100:5.1f}% of budget")
+            print("  Build with:  --volumes auto")
     return 0
 
 
@@ -125,14 +168,25 @@ def _cmd_build(args) -> int:
         device_key=args.device,
         chapters=not args.no_chapters,
         chapter_style=args.chapter_style,
+        volumes=args.volumes,
     )
-    metadata = tags.Metadata(
-        title=args.title, author=args.author, narrator=args.narrator,
-        album=args.album, year=args.year, genre=args.genre,
-        comment=args.comment, description=args.description,
-        synopsis=args.synopsis, publisher=args.publisher,
-        cover_path=args.cover,
-    )
+
+    metadata = tags.Metadata()
+    if args.inherit_tags:
+        for track in tracks:
+            metadata = tags.read_source_metadata(track.path)
+            if not metadata.is_empty():
+                print(f"Inherited tags from {track.path.name}", file=sys.stderr)
+                break
+    # Anything given explicitly overrides what the sources carried.
+    for name in ("title", "author", "narrator", "album", "year", "genre",
+                 "comment", "description", "synopsis", "publisher"):
+        value = getattr(args, name)
+        if value:
+            setattr(metadata, name, value)
+    if args.cover is not None:
+        metadata.cover_path = args.cover
+        metadata.cover_data = None
 
     state = {"phase": ""}
 
@@ -144,7 +198,7 @@ def _cmd_build(args) -> int:
               end="", file=sys.stderr, flush=True)
 
     try:
-        result = build.build(
+        results = build.build_volumes(
             tracks, args.out, settings, metadata,
             progress=progress, overwrite=args.force,
         )
@@ -156,15 +210,19 @@ def _cmd_build(args) -> int:
         raise SystemExit("cancelled")
 
     print(file=sys.stderr)
-    print(f"\n{result.output}")
-    print(f"  {limits.format_duration(result.duration_s)}  "
-          f"{limits.format_size(result.size_bytes)}  "
-          f"{result.chapters} chapters")
     device = settings.device
-    if device.has_limit:
-        usage = result.samples / device.max_samples * 100
-        print(f"  {limits.format_samples(result.samples)} samples "
-              f"({usage:.0f}% of the {device.label} limit)")
+    print()
+    if len(results) > 1:
+        print(f"{len(results)} volumes written:")
+    for result in results:
+        print(f"{result.output}")
+        print(f"  {limits.format_duration(result.duration_s)}  "
+              f"{limits.format_size(result.size_bytes)}  "
+              f"{result.chapters} chapters")
+        if device.has_limit:
+            usage = result.samples / device.max_samples * 100
+            print(f"  {limits.format_samples(result.samples)} samples "
+                  f"({usage:.0f}% of the {device.label} limit)")
     return 0
 
 

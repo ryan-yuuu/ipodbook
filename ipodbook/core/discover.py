@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .measure import SourceChapter
 
 #: Extensions we hand to ffmpeg. MP3 is the common case for ripped audiobooks,
 #: but the decode step is codec-agnostic so anything ffmpeg reads works.
@@ -64,7 +68,34 @@ def sort_naturally(paths: list[Path]) -> list[Path]:
     return sorted(paths, key=_path_sort_key)
 
 
-def chapter_title(path: Path, style: str, index: int, *, root: Path | None = None) -> str:
+#: Embedded chapters shorter than this are treated as markers, not chapters.
+#: Splitters that cut a book into per-chapter files routinely leave zero-length
+#: entries at both edges naming the neighbouring file's chapter -- on a real
+#: 117-file audiobook, 187 of 304 embedded entries were of this kind.
+MIN_EMBEDDED_CHAPTER_S = 1.0
+
+
+def embedded_title(chapters: Sequence["SourceChapter"]) -> str:
+    """Title of the embedded chapter that actually covers a file, or "".
+
+    Picks the longest real chapter rather than the first, so the boundary
+    markers described above cannot win. Titles are stripped, which also removes
+    the trailing carriage returns some taggers leave behind.
+    """
+    real = [c for c in chapters if c.seconds >= MIN_EMBEDDED_CHAPTER_S]
+    if not real:
+        return ""
+    return max(real, key=lambda c: c.seconds).title.strip()
+
+
+def chapter_title(
+    path: Path,
+    style: str,
+    index: int,
+    *,
+    root: Path | None = None,
+    chapters: Sequence["SourceChapter"] | None = None,
+) -> str:
     """Derive a chapter title from a file path.
 
     Styles:
@@ -72,9 +103,16 @@ def chapter_title(path: Path, style: str, index: int, *, root: Path | None = Non
       ``folder``    -- "disc 1 - track01"  (parent folder prefix; disambiguates
                        multi-disc rips where track names repeat per disc)
       ``number``    -- "Chapter 1"
+      ``embedded``  -- the title the file already carries ("Chapter 47"),
+                       falling back to ``filename`` when it has none
     """
     if style == "number":
         return f"Chapter {index + 1}"
+    if style == "embedded":
+        title = embedded_title(chapters or ())
+        if title:
+            return title
+        style = "filename"
     stem = path.stem
     if style == "folder":
         parent = path.parent.name

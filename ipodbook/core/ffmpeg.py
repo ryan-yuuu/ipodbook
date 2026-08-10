@@ -102,9 +102,13 @@ def probe(path: str | Path, *, streams: bool = True, chapters: bool = False) -> 
     return json.loads(result.stdout)
 
 
-def audio_stream_info(path: str | Path) -> dict:
-    """Codec, sample rate and channel count of the first audio stream."""
-    data = probe(path)
+def audio_stream(data: dict, name: str = "file") -> dict:
+    """Codec, sample rate and channel count from an already-parsed probe.
+
+    Audiobook m4b files routinely carry a chapter text track, a cover image and
+    a binary data track alongside the audio, so the first stream is not
+    necessarily the one we want.
+    """
     for stream in data.get("streams", []):
         if stream.get("codec_type") == "audio":
             return {
@@ -113,7 +117,20 @@ def audio_stream_info(path: str | Path) -> dict:
                 "channels": int(stream.get("channels", 0) or 0),
                 "profile": stream.get("profile"),
             }
-    raise RuntimeError(f"no audio stream in {Path(path).name}")
+    raise RuntimeError(f"no audio stream in {name}")
+
+
+def container_duration(data: dict) -> float:
+    """Container-reported duration from an already-parsed probe."""
+    try:
+        return float(data["format"]["duration"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def audio_stream_info(path: str | Path) -> dict:
+    """Codec, sample rate and channel count of the file's audio stream."""
+    return audio_stream(probe(path), Path(path).name)
 
 
 def estimated_duration(path: str | Path) -> float:
@@ -123,8 +140,21 @@ def estimated_duration(path: str | Path) -> float:
     estimating from bitrate, which ran ~0.5% low on real CD rips. Good enough
     for instant feedback, never for chapter boundaries. Use ``measure`` for those.
     """
-    data = probe(path, streams=False)
-    try:
-        return float(data["format"]["duration"])
-    except (KeyError, TypeError, ValueError):
-        return 0.0
+    return container_duration(probe(path, streams=False))
+
+
+def extract_cover(path: str | Path) -> bytes:
+    """Embedded cover art as image bytes, or empty if the file has none.
+
+    Goes through ffmpeg rather than a tag library so MP3, FLAC and MP4 sources
+    all work through one path: in every container ffmpeg exposes attached
+    artwork as a video stream that can be copied straight out.
+    """
+    result = subprocess.run(
+        [ffmpeg_path(), "-v", "error", "-nostdin", "-i", str(path),
+         "-map", "0:v:0", "-frames:v", "1", "-c", "copy", "-f", "image2pipe", "-"],
+        capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        return b""  # no attached picture; not an error worth surfacing
+    return result.stdout

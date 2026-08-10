@@ -15,6 +15,7 @@ avoids having to choose.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Sequence
@@ -43,6 +44,22 @@ _FREEFORM = {
 }
 
 
+#: Source container tags -> Metadata fields. ffprobe normalises tag names
+#: across containers, so one table serves MP3, FLAC and MP4 sources alike.
+_SOURCE_TAGS = {
+    "title": ("title",),
+    "author": ("artist", "album_artist"),
+    "narrator": ("composer",),
+    "album": ("album",),
+    "genre": ("genre",),
+    "comment": ("comment",),
+    "description": ("description",),
+    "publisher": ("publisher",),
+}
+
+_NON_TEXT_FIELDS = {"cover_path", "cover_data", "track"}
+
+
 @dataclass
 class Metadata:
     """Optional descriptive tags. Blank fields are simply not written."""
@@ -58,11 +75,61 @@ class Metadata:
     synopsis: str = ""      # long blurb  -> ldes
     publisher: str = ""
     cover_path: Path | None = None
+    #: Cover image bytes, used in preference to ``cover_path``. Lets artwork
+    #: inherited from a source file travel without a temporary file on disk.
+    cover_data: bytes | None = None
+    #: ``(number, total)`` -> ``trkn``, so players order a multi-volume book.
+    track: tuple[int, int] | None = None
 
     def is_empty(self) -> bool:
         return not any(
-            getattr(self, f.name) for f in fields(self) if f.name != "cover_path"
-        ) and self.cover_path is None
+            getattr(self, f.name) for f in fields(self) if f.name not in _NON_TEXT_FIELDS
+        ) and self.cover_path is None and not self.cover_data
+
+    def has_cover(self) -> bool:
+        return bool(self.cover_data) or (
+            self.cover_path is not None and Path(self.cover_path).is_file()
+        )
+
+
+def _first_tag(source: dict, names: tuple[str, ...]) -> str:
+    lowered = {str(k).lower(): v for k, v in source.items()}
+    for name in names:
+        value = lowered.get(name)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def read_source_metadata(path: Path, *, cover: bool = True) -> Metadata:
+    """Recover the tags a source file already carries.
+
+    Merging parts of an existing audiobook means the title, author, narrator and
+    artwork are already sitting in the files; this reads them back so they need
+    not be retyped. Returns whatever was found -- absent tags stay blank.
+    """
+    from . import ffmpeg
+
+    meta = Metadata()
+    try:
+        source = ffmpeg.probe(path, streams=False).get("format", {}).get("tags", {})
+    except Exception:  # noqa: BLE001 - inheriting tags is a convenience, never fatal
+        return meta
+
+    for attr, names in _SOURCE_TAGS.items():
+        setattr(meta, attr, _first_tag(source, names))
+
+    # Dates arrive as "2010", "2010-06-01" or a full timestamp; keep the year.
+    match = re.search(r"\d{4}", _first_tag(source, ("date", "year")))
+    if match:
+        meta.year = match.group(0)
+
+    if cover:
+        try:
+            meta.cover_data = ffmpeg.extract_cover(path) or None
+        except Exception:  # noqa: BLE001
+            meta.cover_data = None
+    return meta
 
 
 @dataclass
@@ -121,12 +188,10 @@ def write_ffmetadata(path: Path, chapters: Sequence[Chapter]) -> Path:
     return path
 
 
-def _cover_atom(cover_path: Path):
+def _cover_atom(data: bytes, suffix: str = ""):
     from mutagen.mp4 import MP4Cover
 
-    data = cover_path.read_bytes()
-    suffix = cover_path.suffix.lower()
-    if suffix == ".png" or data[:8] == b"\x89PNG\r\n\x1a\n":
+    if suffix.lower() == ".png" or data[:8] == b"\x89PNG\r\n\x1a\n":
         fmt = MP4Cover.FORMAT_PNG
     else:
         fmt = MP4Cover.FORMAT_JPEG
@@ -166,7 +231,13 @@ def apply_tags(target: Path, meta: Metadata) -> None:
         if value:
             tags[atom] = [MP4FreeForm(value.encode("utf-8"), AtomDataType.UTF8)]
 
-    if meta.cover_path is not None and Path(meta.cover_path).is_file():
-        tags["covr"] = [_cover_atom(Path(meta.cover_path))]
+    if meta.track is not None:
+        tags["trkn"] = [(int(meta.track[0]), int(meta.track[1]))]
+
+    if meta.cover_data:
+        tags["covr"] = [_cover_atom(meta.cover_data)]
+    elif meta.cover_path is not None and Path(meta.cover_path).is_file():
+        path = Path(meta.cover_path)
+        tags["covr"] = [_cover_atom(path.read_bytes(), path.suffix)]
 
     audio.save()
