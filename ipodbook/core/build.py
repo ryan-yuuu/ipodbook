@@ -10,14 +10,18 @@ Raw PCM carries no timestamps, so there is nothing to drift.
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 from . import discover, ffmpeg, limits, measure, tags, verify
 from .measure import Cancelled, TrackInfo
@@ -69,15 +73,58 @@ def _noop(phase: str, fraction: float, detail: str) -> None:  # pragma: no cover
     pass
 
 
+@contextmanager
+def _staging() -> Iterator[Path]:
+    """A scratch directory to assemble output in, outside the destination.
+
+    Building in place used to mean a dot-prefixed temporary file sitting in the
+    destination for the whole encode. In an iCloud Drive folder macOS's
+    FileProvider daemon notices such files and sets ``UF_HIDDEN`` on them within
+    about a minute; rename preserves flags, and clearing the flag afterwards
+    races the daemon and loses often enough to matter -- three of four real
+    builds came out invisible in Finder.
+
+    Assembling somewhere the daemon does not watch removes the race rather than
+    fighting it, and has the side benefit that a sync client never sees a
+    partial file at all.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="ipodbook-"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _deliver(temp: Path, output: Path) -> None:
+    """Move a finished file into place, atomically wherever possible.
+
+    ``os.replace`` is atomic but cannot cross filesystems. When it can't, copy
+    to a neighbour of the destination and swap: the intermediate lives only for
+    the length of a file copy and carries no leading dot, so the file provider
+    has neither the time nor the cue to flag it.
+    """
+    try:
+        os.replace(temp, output)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    near = output.parent / f"{output.stem}.{uuid.uuid4().hex[:8]}.part"
+    try:
+        shutil.copyfile(temp, near)
+        os.replace(near, output)
+    except BaseException:
+        near.unlink(missing_ok=True)
+        raise
+
+
 def _unhide(path: Path) -> None:
     """Clear the macOS hidden flag from a finished file.
 
-    The build assembles output under a dot-prefixed temporary name so a partial
-    file neither clutters the destination nor gets uploaded by a sync client.
-    In an iCloud Drive folder, though, macOS's FileProvider daemon notices such
-    files and sets ``UF_HIDDEN`` on them within about a minute -- and rename
-    preserves flags. Without this, a long build into iCloud Drive would produce
-    a perfectly good file that never appears in Finder.
+    Staging outside the destination should mean nothing is ever flagged, but
+    this stays as a cheap backstop -- a file inheriting the flag some other way
+    would otherwise be a perfectly good build that never appears in Finder.
 
     No-op on platforms without BSD file flags.
     """
@@ -334,12 +381,18 @@ def _build_one(
     progress: ProgressFn,
     cancel: threading.Event,
 ) -> BuildResult:
-    """Assemble, tag and verify one output file, then move it into place."""
-    total_s = measure.total_seconds(tracks)
-    temp = output.parent / f".{output.stem}.{uuid.uuid4().hex[:8]}.tmp.m4b"
-    ffmeta_path: Path | None = None
+    """Assemble, tag and verify one output file, then move it into place.
 
-    try:
+    Everything happens in a scratch directory; the destination sees the file
+    only once it has passed verification, so a failed or cancelled build cannot
+    leave anything behind at all.
+    """
+    total_s = measure.total_seconds(tracks)
+
+    with _staging() as work:
+        temp = work / "audiobook.m4b"
+        ffmeta_path: Path | None = None
+
         # --- chapters ------------------------------------------------------
         if settings.chapters:
             root = discover.common_root([t.path for t in tracks])
@@ -352,7 +405,7 @@ def _build_one(
             chapter_list = tags.chapters_from_durations(
                 [t.seconds for t in tracks], titles
             )
-            ffmeta_path = temp.with_suffix(".ffmeta")
+            ffmeta_path = work / "chapters.ffmeta"
             tags.write_ffmetadata(ffmeta_path, chapter_list)
         else:
             chapter_list = []
@@ -380,7 +433,7 @@ def _build_one(
         if not report.ok:
             raise BuildError("Output failed verification:\n" + "\n".join(report.problems))
 
-        os.replace(temp, output)
+        _deliver(temp, output)
         _unhide(output)
         progress(PHASE_VERIFY, 1.0, "done")
         return BuildResult(
@@ -390,12 +443,6 @@ def _build_one(
             size_bytes=report.size_bytes,
             chapters=report.chapters,
         )
-    except BaseException:
-        temp.unlink(missing_ok=True)
-        raise
-    finally:
-        if ffmeta_path is not None:
-            ffmeta_path.unlink(missing_ok=True)
 
 
 def _over_budget_error(total_s: float, settings: Settings) -> BuildError:

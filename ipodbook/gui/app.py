@@ -610,6 +610,46 @@ class MainWindow(QMainWindow):
         rates = {t.sample_rate for t in self.tracks if t.ok and t.sample_rate}
         return min(rates) if rates else 0
 
+    def _source_rates(self) -> list[int]:
+        """Every distinct sample rate present in the sources, ascending."""
+        return sorted({t.sample_rate for t in self.tracks if t.ok and t.sample_rate})
+
+    def _source_rate_advice(self, rate: int) -> str:
+        """Say how the chosen rate compares with what the sources actually hold.
+
+        Encoding above a file's own rate cannot recover detail that was never
+        captured; it only inflates the output and spends sample budget on an
+        empty frequency band. Saying so where the choice is made beats leaving
+        it to be inferred from the summary line.
+        """
+        rates = self._source_rates()
+        if not rates:
+            return ""
+        ceiling = limits.nyquist_hz(rate) / 1000
+
+        if len(rates) == 1:
+            only = rates[0]
+            origin = f"Your files are {only / 1000:g} kHz"
+            if rate > only:
+                return (f" {origin}, so this is upsampling: it adds no detail, and "
+                        "costs file size and sample budget.")
+            if rate == only:
+                return f" {origin} — this matches, so nothing is resampled."
+            return f" {origin}, so this discards everything above {ceiling:g} kHz."
+
+        # Mixed sources have no single right answer: any rate either upsamples
+        # the quieter files or trims the richer ones, so name both effects.
+        span = f"Your files run from {rates[0] / 1000:g} to {rates[-1] / 1000:g} kHz"
+        if rate >= rates[-1]:
+            return (f" {span}. Nothing is discarded, but the lower-rate files are "
+                    "upsampled and gain no detail from it.")
+        if rate <= rates[0]:
+            return f" {span}, so every file loses everything above {ceiling:g} kHz."
+        below = sum(1 for r in rates if r < rate)
+        lower = "1 lower rate is" if below == 1 else f"{below} lower rates are"
+        return (f" {span}. The {lower} upsampled for no gain; the rest lose "
+                f"everything above {ceiling:g} kHz.")
+
     def _preferred_rate(self, seconds: float) -> int:
         """The rate to select when the user has not chosen one.
 
@@ -637,6 +677,13 @@ class MainWindow(QMainWindow):
         for rate in limits.AAC_SAMPLE_RATES:
             usable = self._rate_usable(rate, seconds)
             label = f"{rate / 1000:g} kHz"
+            # Only flag a rate as pure waste when it exceeds every source, and
+            # only call it a match when the sources agree on one rate.
+            source_rates = self._source_rates()
+            if source_rates and rate > source_rates[-1]:
+                label += "  ↑ above source"
+            elif source_rates == [rate]:
+                label += "  = source"
             if seconds > 0 and device.has_limit:
                 if not usable:
                     label += "  -  too long"
@@ -675,7 +722,7 @@ class MainWindow(QMainWindow):
         self.rate_help.setText(
             limits.describe_rate(rate, self._budget_seconds(), device.max_samples)
             + f". Half this value ({limits.nyquist_hz(rate) / 1000:g} kHz) is the "
-            "highest frequency kept."
+            "highest frequency kept." + self._source_rate_advice(rate)
         )
         if seconds > 0:
             size = limits.estimated_size_bytes(seconds, bitrate, rate)

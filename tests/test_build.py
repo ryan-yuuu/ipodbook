@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,93 @@ class TestCheckDestination:
     def test_a_missing_folder_is_reported(self, tmp_path):
         with pytest.raises(build.BuildError, match="does not exist"):
             build._check_destination(tmp_path / "nope" / "b.m4b", self.sources(), overwrite=False)
+
+
+class TestStagingAndDelivery:
+    """Output is assembled away from the destination, then moved in.
+
+    Building in place left a dot-prefixed file in the destination for the whole
+    encode, which iCloud's file provider flags hidden -- and clearing the flag
+    afterwards races the daemon.
+    """
+
+    def test_staging_is_outside_the_destination(self, tmp_path):
+        with build._staging() as work:
+            assert work.is_dir()
+            assert tmp_path not in work.parents
+            assert work != tmp_path
+
+    def test_staging_is_removed_afterwards(self):
+        with build._staging() as work:
+            (work / "partial.m4b").write_bytes(b"junk")
+        assert not work.exists()
+
+    def test_staging_is_removed_even_when_the_build_fails(self):
+        with pytest.raises(RuntimeError):
+            with build._staging() as work:
+                (work / "partial.m4b").write_bytes(b"junk")
+                raise RuntimeError("encode blew up")
+        assert not work.exists()
+
+    def test_two_builds_do_not_share_a_staging_directory(self):
+        with build._staging() as first, build._staging() as second:
+            assert first != second
+
+    def test_deliver_moves_the_file_into_place(self, tmp_path):
+        temp, out = tmp_path / "staged.m4b", tmp_path / "Book.m4b"
+        temp.write_bytes(b"audio")
+        build._deliver(temp, out)
+        assert out.read_bytes() == b"audio"
+        assert not temp.exists()
+
+    def test_deliver_replaces_an_existing_file(self, tmp_path):
+        temp, out = tmp_path / "staged.m4b", tmp_path / "Book.m4b"
+        temp.write_bytes(b"new")
+        out.write_bytes(b"old")
+        build._deliver(temp, out)
+        assert out.read_bytes() == b"new"
+
+    def test_deliver_falls_back_when_filesystems_differ(self, tmp_path, monkeypatch):
+        import errno as errno_mod
+        temp, out = tmp_path / "staged.m4b", tmp_path / "Book.m4b"
+        temp.write_bytes(b"audio")
+        real = os.replace
+        calls = []
+
+        def fake_replace(src, dst):
+            calls.append((Path(src).name, Path(dst).name))
+            if len(calls) == 1:                       # the direct move
+                raise OSError(errno_mod.EXDEV, "cross-device link")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "replace", fake_replace)
+        build._deliver(temp, out)
+        assert out.read_bytes() == b"audio"
+        # The copy lands next to the destination and is swapped in atomically.
+        assert calls[1][1] == "Book.m4b"
+        assert not calls[1][0].startswith(".")        # never dot-prefixed
+        assert list(tmp_path.glob("*.part")) == []    # and never left behind
+
+    def test_deliver_leaves_nothing_behind_when_the_copy_fails(self, tmp_path, monkeypatch):
+        import errno as errno_mod
+        temp, out = tmp_path / "staged.m4b", tmp_path / "Book.m4b"
+        temp.write_bytes(b"audio")
+        monkeypatch.setattr(os, "replace", lambda s, d: (_ for _ in ()).throw(
+            OSError(errno_mod.EXDEV, "cross-device link")))
+        monkeypatch.setattr(build.shutil, "copyfile", lambda s, d: (_ for _ in ()).throw(
+            OSError("disk full")))
+        with pytest.raises(OSError):
+            build._deliver(temp, out)
+        assert not out.exists()
+        assert list(tmp_path.glob("*.part")) == []
+
+    def test_unexpected_replace_errors_are_not_swallowed(self, tmp_path, monkeypatch):
+        temp, out = tmp_path / "staged.m4b", tmp_path / "Book.m4b"
+        temp.write_bytes(b"audio")
+        monkeypatch.setattr(os, "replace", lambda s, d: (_ for _ in ()).throw(
+            OSError(13, "permission denied")))
+        with pytest.raises(OSError):
+            build._deliver(temp, out)
 
 
 class TestMetadata:
